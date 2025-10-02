@@ -117,20 +117,26 @@ except Exception as e:
 __all__ = ['openai_client']
 
 
-# Initialize AWS S3 client
-try:
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.getenv('AWS_REGION', 'us-east-1')
-    )
-    S3_BUCKET = os.getenv('S3_BUCKET_NAME')
-    NOTES_BUCKET = os.getenv('NOTES_BUCKET_NAME')  # Separate bucket for notes
-    logging.info("AWS S3 Connection Successful!")
-except Exception as e:
-    logging.info(f"AWS S3 Connection Error: {e}")
-    s3_client = None
+# Initialize AWS S3 client (disabled for local development)
+# try:
+#     s3_client = boto3.client(
+#         's3',
+#         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+#         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+#         region_name=os.getenv('AWS_REGION', 'us-east-1')
+#     )
+#     S3_BUCKET = os.getenv('S3_BUCKET_NAME')
+#     NOTES_BUCKET = os.getenv('NOTES_BUCKET_NAME')  # Separate bucket for notes
+#     logging.info("AWS S3 Connection Successful!")
+# except Exception as e:
+#     logging.info(f"AWS S3 Connection Error: {e}")
+#     s3_client = None
+
+# Local storage configuration
+GENERATED_PDFS_DIR = 'generated_pdfs'
+os.makedirs(GENERATED_PDFS_DIR, exist_ok=True)
+TEMP_UPLOADS_DIR = 'temp_uploads'
+os.makedirs(TEMP_UPLOADS_DIR, exist_ok=True)
 
 # Add memory monitoring function
 def monitor_memory():
@@ -155,6 +161,13 @@ def serve():
 
 @app.route('/<path:path>')
 def serve_static(path):
+    # Serve locally generated PDFs even though they are outside the static folder
+    try:
+        if path.startswith('generated_pdfs/'):
+            filename = path[len('generated_pdfs/'):]
+            return send_from_directory(GENERATED_PDFS_DIR, filename, mimetype='application/pdf', as_attachment=True)
+    except Exception:
+        pass
     if path and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
     return send_from_directory(app.static_folder, 'index.html')
@@ -263,18 +276,13 @@ def generate_questions():
             subject_name=data['subjectName']
         )
 
-        s3_client.upload_fileobj(
-            pdf_buffer,
-            S3_BUCKET,
-            pdf_filename,
-            ExtraArgs={'ContentType': 'application/pdf'}
-        )
+        # Save PDF locally and build local URL (AWS disabled)
+        pdf_buffer.seek(0)
+        local_pdf_path = os.path.join(GENERATED_PDFS_DIR, pdf_filename)
+        with open(local_pdf_path, 'wb') as f:
+            f.write(pdf_buffer.read())
 
-        pdf_url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': S3_BUCKET, 'Key': pdf_filename},
-            ExpiresIn=3600
-        )
+        pdf_url = f"/generated_pdfs/{pdf_filename}"
 
         # Final cleanups
         if os.path.exists(vectorstore_path):
@@ -374,27 +382,19 @@ def generate_questions():
 def download_pdf(paper_id):
     try:
         filename = f"question_paper_{paper_id}.pdf"
-        # Generate a pre-signed URL for the S3 object
-        url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={
-                'Bucket': S3_BUCKET,
-                'Key': filename
-            },
-            ExpiresIn=3600  # URL expires in 1 hour
-        )
+        local_path = os.path.join(GENERATED_PDFS_DIR, filename)
+        if not os.path.exists(local_path):
+            return jsonify({'success': False, 'error': 'PDF not found'}), 404
 
-        
-        
-        return jsonify({
-            'success': True,
-            'url': url
-        })
+        url = f"/generated_pdfs/{filename}"
+        return jsonify({'success': True, 'url': url})
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# Static route to serve locally saved PDFs
+@app.route('/generated_pdfs/<path:filename>')
+def serve_generated_pdfs(filename):
+    return send_from_directory(GENERATED_PDFS_DIR, filename, mimetype='application/pdf', as_attachment=True)
     
 # @app.route('/api/n8n-webhook', methods=['POST'])
 # def n8n_webhook():
@@ -431,20 +431,20 @@ def upload_note():
         logging.info(f"Saving file to: {local_path}")
         file.save(local_path)
 
-        # Upload to S3 (no metadata)
-        s3_client.upload_fileobj(
-            file,
-            NOTES_BUCKET,
-            filename,
-            ExtraArgs={'ContentType': 'application/pdf'}
-        )
-        logging.info(f"File uploaded to S3: {filename}")
+        # Upload to S3 disabled; file kept locally
+        # s3_client.upload_fileobj(
+        #     file,
+        #     NOTES_BUCKET,
+        #     filename,
+        #     ExtraArgs={'ContentType': 'application/pdf'}
+        # )
+        # logging.info(f"File uploaded to S3: {filename}")
         # Save note metadata to MongoDB
         note_data = {
             'filename': filename,
             'original_name': file.filename,
             'uploaded_at': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S'),
-            's3_url': f"s3://{NOTES_BUCKET}/{filename}"
+            'local_path': local_path
         }
         notes_collection = db['notes']
         note_id = notes_collection.insert_one(note_data).inserted_id
